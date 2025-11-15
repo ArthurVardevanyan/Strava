@@ -1,4 +1,6 @@
-# Strava Activity Downloader
+# Strava Activity Commands (WIP)
+
+Some Commands put together for migration purposes
 
 This repository contains `strava.py`, a CLI utility that lists your Strava activities, enriches them with location details, and optionally saves activity files (GPX/TCX/original zip) organized by country/state/city.
 
@@ -47,4 +49,29 @@ See `python .\strava.py --help` for the complete list of CLI options (CSV export
 python .\strava.py --location-details --detail-sleep-ms 200 --types Walk,Hike  --geocode --geocode-sleep-ms 250 --progress-bar  --download --download-format gpx --test
 
 python .\strava.py --rescan-unknown --geocode --geocode-sleep-ms 250 --progress-bar --test
+
+python strava.py --retro-convert-fit
 ```
+
+## REF
+
+Primary documentation and resources referenced while building this script:
+
+- Garmin FIT Protocol: <https://developer.garmin.com/fit/protocol/>
+- Garmin FIT SDK (for field numbers, CRC reference): <https://developer.garmin.com/fit/sdk/>
+- Strava V3 API Overview: <https://developers.strava.com/>
+- Strava Rate Limits: <https://developers.strava.com/docs/rate-limits/>
+- Strava Activity Streams: <https://developers.strava.com/docs/reference/#api-Streams>
+- GPX 1.1 Schema: <https://www.topografix.com/gpx.asp>
+- TCX (Training Center XML) Schema: <https://www8.garmin.com/xmlschemas/TrainingCenterDatabasev2.xsd>
+- FIT File Basics / Reverse Engineering Notes (community): <https://www.thisisant.com/forum/viewthread/4492/> (ANT+ forums)
+- OpenStreetMap Nominatim API (reverse geocoding): <https://nominatim.org/release-docs/latest/api/Reverse/>
+- Haversine formula reference (distance between lat/lon points): <https://en.wikipedia.org/wiki/Haversine_formula>
+- Python datetime ISO parsing: <https://docs.python.org/3/library/datetime.html>
+- Python requests library: <https://requests.readthedocs.io/>
+- Semicircle coordinate conversion (FIT lat/lon): <https://forums.garmin.com/developer/fit-sdk/f/discussion/> (various posts)
+
+If you extend support for other sports or add developer data messages, also consult:
+
+- FIT Profile CSVs (sport/subsport enums): included in FIT SDK downloads
+- Developer data fields guide: <https://developer.garmin.com/fit/protocol/#developerData>

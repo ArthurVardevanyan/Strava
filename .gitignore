@@ -37,5 +37,9 @@ override.tf.json
 # example: *tfplan*
 .terraform.lock.hcl
 backend.conf
-downloaded_activities/*
+downloaded*
+garmin*
+tcx*
+fit*
 strava_secrets.json
+__pycache__
