@@ -50,7 +50,7 @@ python .\strava.py --location-details --detail-sleep-ms 200 --types Walk,Hike  -
 
 python .\strava.py --rescan-unknown --geocode --geocode-sleep-ms 250 --progress-bar --test
 
-python strava.py --retro-convert-fit
+python .\strava.py --retro-convert-fit --local-tz America/Detroit --force-local-tz-for-all
 ```
 
 ## REF

@@ -9,6 +9,10 @@ from typing import Any, Dict, List, Optional, Set, Tuple
 
 import requests
 import xml.etree.ElementTree as ET
+try:
+	from zoneinfo import ZoneInfo  # Python 3.9+
+except Exception:
+	ZoneInfo = None  # Will fallback if missing
 
 SCRIPT_ROOT = os.path.dirname(os.path.abspath(__file__))
 
@@ -157,7 +161,14 @@ def run_retro_convert_fit(args) -> int:
 		if os.path.exists(dest):
 			skipped += 1
 			continue
-		ok = convert_gpx_file_to_fit(path, dest, activity_type, activity_name)
+		ok = convert_gpx_file_to_fit(
+			path, dest, activity_type, activity_name,
+			prefer_generic_with_subsport=True,
+			assume_naive_offset=getattr(args, 'assume_naive_offset', None),
+			force_tz_offset_for_all=getattr(args, 'force_tz_offset_for_all', False),
+			local_tz_name=getattr(args, 'local_tz', None),
+			force_local_tz_for_all=getattr(args, 'force_local_tz_for_all', False),
+		)
 		if ok:
 			converted += 1
 		else:
@@ -484,7 +495,16 @@ def fetch_activity_streams(access_token: str, activity_id: int, *, timeout_s: in
 
 
 def build_gpx_from_streams(activity: Dict, streams: Dict[str, Dict]) -> bytes:
-	"""Construct a GPX blob from Strava activity streams."""
+	"""Construct a GPX blob from Strava activity streams.
+
+	Timestamp handling:
+	Strava provides both start_date (UTC) and start_date_local (local tz). Previously we
+	used start_date_local which produced naive ISO strings (no timezone offset) in the
+	GPX <time> elements. Later FIT conversion interpreted those as UTC, shifting times.
+	We now always anchor to start_date (UTC) and emit explicit 'Z' suffixed timestamps.
+	If start_date is missing, we fall back to parsing start_date_local; if that is naive
+	we still treat it as UTC to preserve previous behavior but mark with 'Z'.
+	"""
 	latlng = streams.get("latlng", {}).get("data") or []
 	if not latlng:
 		raise ValueError("No location stream available to build GPX.")
@@ -495,8 +515,18 @@ def build_gpx_from_streams(activity: Dict, streams: Dict[str, Dict]) -> bytes:
 	name = ET.SubElement(trk, "name")
 	name.text = activity.get("name") or f"Activity {activity.get('id')}"
 	trkseg = ET.SubElement(trk, "trkseg")
-	start_iso = activity.get("start_date_local") or activity.get("start_date")
-	start_dt = _parse_iso_datetime(start_iso)
+	# Prefer UTC start
+	start_iso_utc = activity.get("start_date") or ""
+	start_dt = _parse_iso_datetime(start_iso_utc)
+	if start_dt and start_dt.tzinfo is None:
+		# Assume UTC if Strava string lost its offset
+		start_dt = start_dt.replace(tzinfo=dt.timezone.utc)
+	if not start_dt:
+		# Fallback to local date; if naive treat as UTC (best-effort)
+		start_iso_local = activity.get("start_date_local") or ""
+		start_dt = _parse_iso_datetime(start_iso_local)
+		if start_dt and start_dt.tzinfo is None:
+			start_dt = start_dt.replace(tzinfo=dt.timezone.utc)
 	for idx, point in enumerate(latlng):
 		if not point or len(point) != 2:
 			continue
@@ -507,8 +537,12 @@ def build_gpx_from_streams(activity: Dict, streams: Dict[str, Dict]) -> bytes:
 		if time_data and start_dt:
 			seconds = float(time_data[idx]) if idx < len(time_data) else 0.0
 			pt_time = start_dt + dt.timedelta(seconds=seconds)
+			# Ensure UTC and 'Z' suffix
+			if pt_time.tzinfo is None:
+				pt_time = pt_time.replace(tzinfo=dt.timezone.utc)
+			pt_time_utc = pt_time.astimezone(dt.timezone.utc).replace(microsecond=0)
 			time_el = ET.SubElement(trkpt, "time")
-			time_el.text = pt_time.replace(microsecond=0).isoformat()
+			time_el.text = pt_time_utc.isoformat().replace('+00:00', 'Z')
 	return ET.tostring(track, encoding="utf-8", xml_declaration=True)
 
 
@@ -760,7 +794,18 @@ def _fit_crc16(data: bytes) -> int:
 		crc ^= tmp ^ crc_table[(b >> 4) & 0xF]
 	return crc & 0xFFFF
 
-def convert_gpx_to_fit(gpx_bytes: bytes, *, activity_type: str, activity_name: Optional[str] = None, include_sport_message: bool = False, prefer_generic_with_subsport: bool = False) -> bytes:
+def convert_gpx_to_fit(
+	gpx_bytes: bytes,
+	*,
+	activity_type: str,
+	activity_name: Optional[str] = None,
+	include_sport_message: bool = False,
+	prefer_generic_with_subsport: bool = False,
+	assume_naive_offset: Optional[str] = None,
+	force_tz_offset_for_all: bool = False,
+	local_tz_name: Optional[str] = None,
+	force_local_tz_for_all: bool = False,
+) -> bytes:
 	"""Convert GPX bytes to a FIT activity file.
 
 	Message order (lean): file_id -> device_info -> event(start) -> record* -> event(stop) -> lap -> session -> activity
@@ -796,14 +841,60 @@ def convert_gpx_to_fit(gpx_bytes: bytes, *, activity_type: str, activity_name: O
 	if not points:
 		return b""
 	FIT_EPOCH = dt.datetime(1989, 12, 31, tzinfo=dt.timezone.utc)
-	def parse_ts(ts: str) -> Optional[int]:
+
+	# Determine timezone to apply to naive timestamps if needed
+	def _parse_offset_to_tz(offset: str) -> Optional[dt.timezone]:
 		try:
-			if ts.endswith('Z'):
-				ts_dt = dt.datetime.fromisoformat(ts[:-1] + '+00:00')
-			else:
-				ts_dt = dt.datetime.fromisoformat(ts)
-			if ts_dt.tzinfo is None:
-				ts_dt = ts_dt.replace(tzinfo=dt.timezone.utc)
+			offset = offset.strip()
+			m = re.match(r"^([+-])(\d{2}):(\d{2})$", offset)
+			if not m:
+				return None
+			sign = -1 if m.group(1) == '-' else 1
+			h = int(m.group(2)); mm = int(m.group(3))
+			return dt.timezone(sign * dt.timedelta(hours=h, minutes=mm))
+		except Exception:
+			return None
+
+	# Choose timezone policy (priority: local_tz_name -> assume_naive_offset -> system local)
+	local_tz_for_naive: dt.tzinfo
+	if local_tz_name and ZoneInfo is not None:
+		try:
+			local_tz_for_naive = ZoneInfo(local_tz_name)
+		except Exception:
+			print(f"Warning: could not load timezone '{local_tz_name}'. Falling back to fixed/system offset; DST may be incorrect. Consider: pip install tzdata")
+			_tz = _parse_offset_to_tz(assume_naive_offset) if assume_naive_offset else None
+			local_tz_for_naive = _tz or (dt.datetime.now().astimezone().tzinfo or dt.timezone.utc)
+	elif assume_naive_offset:
+		_tz = _parse_offset_to_tz(assume_naive_offset)
+		local_tz_for_naive = _tz or (dt.datetime.now().astimezone().tzinfo or dt.timezone.utc)
+	else:
+		local_tz_for_naive = dt.datetime.now().astimezone().tzinfo or dt.timezone.utc
+	def parse_ts(ts: str) -> Optional[int]:
+		"""Parse an ISO8601 timestamp from GPX.
+
+		Behavior:
+		- 'Z' suffix -> treated as UTC.
+		- Explicit offset like +hh:mm is respected.
+		- Naive timestamps (no tzinfo) are assumed to be LOCAL TIME on this machine,
+		  then converted to UTC. This fixes legacy GPX that stored local wall time without
+		  a timezone (previously misinterpreted as UTC causing 3–4h shifts).
+		"""
+		try:
+			iso = ts.strip()
+			if iso.endswith('Z'):
+				iso = iso[:-1] + '+00:00'
+			ts_dt = dt.datetime.fromisoformat(iso)
+			# Determine strategy
+			if force_local_tz_for_all and local_tz_name and ZoneInfo is not None:
+				wall = ts_dt.replace(tzinfo=None)
+				assumed = wall.replace(tzinfo=local_tz_for_naive)
+				ts_dt = assumed.astimezone(dt.timezone.utc)
+			elif force_tz_offset_for_all:
+				wall = ts_dt.replace(tzinfo=None)
+				assumed = wall.replace(tzinfo=local_tz_for_naive)
+				ts_dt = assumed.astimezone(dt.timezone.utc)
+			elif ts_dt.tzinfo is None:
+				ts_dt = ts_dt.replace(tzinfo=local_tz_for_naive).astimezone(dt.timezone.utc)
 			return int((ts_dt - FIT_EPOCH).total_seconds())
 		except Exception:
 			return None
@@ -1096,9 +1187,16 @@ def convert_gpx_to_fit(gpx_bytes: bytes, *, activity_type: str, activity_name: O
 	])
 	body += activity_def
 	activity_data = bytearray([data_header(6)])
-	activity_data += end_ts.to_bytes(4, 'little')  # timestamp (final time)
+	activity_data += end_ts.to_bytes(4, 'little')  # timestamp (final time, UTC)
 	activity_data += scale_time(total_time_s).to_bytes(4, 'little')  # total_timer_time
-	activity_data += end_ts.to_bytes(4, 'little')  # local_timestamp
+	# Compute local_timestamp as local wall time mapped to FIT epoch
+	try:
+		utc_dt = FIT_EPOCH + dt.timedelta(seconds=end_ts)
+		local_dt = utc_dt.astimezone(local_tz_for_naive)
+		local_ts = int((local_dt - FIT_EPOCH).total_seconds())
+	except Exception:
+		local_ts = end_ts
+	activity_data += local_ts.to_bytes(4, 'little')  # local_timestamp (local wall time)
 	activity_data += (1).to_bytes(2, 'little')     # num_sessions
 	activity_data += bytes([0])                    # type manual
 	activity_data += (0).to_bytes(2, 'little')     # event_group
@@ -1120,11 +1218,30 @@ def convert_gpx_to_fit(gpx_bytes: bytes, *, activity_type: str, activity_name: O
 	file_crc = _fit_crc16(file_wo_crc)
 	return file_wo_crc + file_crc.to_bytes(2, 'little')
 
-def convert_gpx_file_to_fit(gpx_path: str, fit_path: str, activity_type: str, activity_name: Optional[str] = None, prefer_generic_with_subsport: bool = True) -> bool:
+def convert_gpx_file_to_fit(
+	gpx_path: str,
+	fit_path: str,
+	activity_type: str,
+	activity_name: Optional[str] = None,
+	prefer_generic_with_subsport: bool = True,
+	assume_naive_offset: Optional[str] = None,
+	force_tz_offset_for_all: bool = False,
+	local_tz_name: Optional[str] = None,
+	force_local_tz_for_all: bool = False,
+) -> bool:
 	try:
 		with open(gpx_path, 'rb') as f:
 			data = f.read()
-			fit = convert_gpx_to_fit(data, activity_type=activity_type, activity_name=activity_name, prefer_generic_with_subsport=prefer_generic_with_subsport)
+			fit = convert_gpx_to_fit(
+				data,
+				activity_type=activity_type,
+				activity_name=activity_name,
+				prefer_generic_with_subsport=prefer_generic_with_subsport,
+				assume_naive_offset=assume_naive_offset,
+				force_tz_offset_for_all=force_tz_offset_for_all,
+				local_tz_name=local_tz_name,
+				force_local_tz_for_all=force_local_tz_for_all,
+			)
 			if not fit:
 				return False
 			os.makedirs(os.path.dirname(fit_path), exist_ok=True)
@@ -1517,6 +1634,14 @@ def main(argv: Optional[Iterable[str]] = None) -> int:
 	parser.add_argument("--download-quiet", action="store_true", help="Silence per-file download logs to keep output tidy.")
 	parser.add_argument("--retro-convert-fit", action="store_true", help="Convert existing downloaded GPX files into minimal FIT format for Garmin import.")
 	parser.add_argument("--retro-convert-fit-dir", default=None, help="Destination folder for converted FIT files (defaults to <root>/fit_converted).")
+	parser.add_argument("--assume-naive-offset", default=None, help="Offset like +04:00 or -05:00 to apply to GPX timestamps that lack a timezone.")
+	# Back-compat flags from README examples
+	parser.add_argument("--repair-gpx-times", action="store_true", help="Deprecated: no-op; naive time handling is automatic. Use --tz-offset.")
+	parser.add_argument("--tz-offset", default=None, help="Alias for --assume-naive-offset (e.g., -04:00).")
+	parser.add_argument("--gpx-to-fit", nargs=2, metavar=("GPX_PATH","FIT_PATH"), default=None, help="Convert a single GPX file to FIT at the given path.")
+	parser.add_argument("--force-tz-offset-for-all", action="store_true", help="Apply the --tz-offset/--assume-naive-offset to all timestamps, even if they already have a timezone.")
+	parser.add_argument("--local-tz", default=None, help="IANA timezone name (e.g., America/Detroit) for DST-aware handling of naive timestamps.")
+	parser.add_argument("--force-local-tz-for-all", action="store_true", help="Reinterpret all timestamps using the --local-tz zone (DST-aware), ignoring any existing offsets in GPX.")
 	parser.add_argument("--validate-fit", type=str, default=None, help="Validate a FIT file or directory tree of FIT files.")
 	parser.add_argument(
 		"--rescan-unknown",
@@ -1525,12 +1650,32 @@ def main(argv: Optional[Iterable[str]] = None) -> int:
 	)
 
 	args = parser.parse_args(list(argv) if argv is not None else None)
+	# Normalize legacy flags
+	if args.tz_offset and not args.assume_naive_offset:
+		args.assume_naive_offset = args.tz_offset
 
 	if args.rescan_unknown:
 		return rescan_unknown_locations(args)
 
 	if args.retro_convert_fit:
 		return run_retro_convert_fit(args)
+	# Single-file conversion path
+	if args.gpx_to_fit:
+		gpx_path, fit_path = args.gpx_to_fit
+		# Try to infer a type from parent folder name, default to Walk
+		folder = os.path.basename(os.path.dirname(gpx_path))
+		activity_type = folder.replace('_',' ') or 'Walk'
+		ok = convert_gpx_file_to_fit(
+			gpx_path, fit_path, activity_type,
+			activity_name=None,
+			prefer_generic_with_subsport=True,
+			assume_naive_offset=args.assume_naive_offset,
+			force_tz_offset_for_all=args.force_tz_offset_for_all,
+			local_tz_name=args.local_tz,
+			force_local_tz_for_all=args.force_local_tz_for_all,
+		)
+		print("Converted" if ok else "Failed", gpx_path, "->", fit_path)
+		return 0 if ok else 1
 	if args.validate_fit:
 		path = args.validate_fit
 		if os.path.isdir(path):
@@ -1703,9 +1848,6 @@ def main(argv: Optional[Iterable[str]] = None) -> int:
 					not (loc["city"] or loc["state"] or loc["country"]) and
 					args.location_details
 				):
-					# Respect details cap
-					if args.details_max is None or args.details_max > 0:
-						# Count an attempted details call
 						details_calls += 1
 						try:
 							progress_cb = (lambda msg: print(msg)) if args.progress else None
