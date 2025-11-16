@@ -6,6 +6,18 @@ from __future__ import annotations
 import sys, os, csv, json, time, re, itertools, zipfile, argparse
 import datetime as dt
 from typing import Any, Dict, List, Optional, Set, Tuple
+import argparse
+import csv
+import datetime as dt
+import json
+import os
+import re
+import sys
+import time
+import itertools
+import xml.etree.ElementTree as ET
+import zipfile
+from typing import Dict, Generator, Iterable, List, Optional, Set, Tuple
 
 import requests
 import xml.etree.ElementTree as ET
@@ -15,6 +27,151 @@ except Exception:
 	ZoneInfo = None  # Will fallback if missing
 
 SCRIPT_ROOT = os.path.dirname(os.path.abspath(__file__))
+
+
+STRAVA_TOKEN_URL = "https://www.strava.com/oauth/token"
+STRAVA_ACTIVITIES_URL = "https://www.strava.com/api/v3/athlete/activities"
+STRAVA_AUTH_URL = "https://www.strava.com/oauth/authorize"
+STRAVA_ACTIVITY_DETAIL_URL_TMPL = "https://www.strava.com/api/v3/activities/{id}"
+STRAVA_ACTIVITY_STREAMS_URL_TMPL = "https://www.strava.com/api/v3/activities/{id}/streams"
+STRAVA_DOWNLOAD_URLS = {
+	"gpx": "https://www.strava.com/activities/{id}/export_gpx",
+	"tcx": "https://www.strava.com/activities/{id}/export_tcx",
+	"original": "https://www.strava.com/activities/{id}/export_original",
+}
+
+def wait_to_next_quarter() -> None:
+	"""Sleep until the next 0/15/30/45 minute slot."""
+	now = dt.datetime.now(dt.timezone.utc)
+	remainder = now.minute % 15
+	minutes_to_add = 15 - remainder if remainder != 0 else 15
+	target = now + dt.timedelta(minutes=minutes_to_add)
+	target = target.replace(second=0, microsecond=0)
+	wait_seconds = (target - now).total_seconds()
+	print(f"Rate limited, waiting until {target.isoformat()} ({int(wait_seconds)}s)", flush=True)
+	time.sleep(wait_seconds)
+
+
+def rescan_unknown_locations(args) -> int:
+	"""Refresh cached downloads stuck under unknown_* folders using local exports and optional geocoding."""
+	unknown_files = find_unknown_location_files(args.download_dir)
+	if not unknown_files:
+		print("No files found in unknown location folders.")
+		return 0
+	geocode_cache: Dict[str, Dict[str, str]] = {}
+	moved = 0
+	for activity_type, activity_id, fmt, path in unknown_files:
+		print(f"Inspecting activity {activity_id} ({activity_type}) from {path}")
+		coords = _extract_latlng_from_file(path, fmt)
+		if coords is None:
+			print(f"Could not parse coordinates for activity {activity_id}; skipping.")
+			continue
+		lat, lng = coords
+		loc = _resolve_location_from_coords(lat, lng, args, geocode_cache)
+		if not loc:
+			if not args.geocode:
+				print(f"Coordinates found but --geocode not enabled; run with --geocode to resolve activity {activity_id}.")
+			else:
+				print(f"Reverse geocode did not yield a city/state/country for activity {activity_id}; skipping.")
+			continue
+		target = build_download_path(args.download_dir, activity_type, loc, activity_id, fmt)
+		if os.path.abspath(path) == os.path.abspath(target):
+			print(f"Activity {activity_id} already in final location: {target}")
+			continue
+		os.makedirs(os.path.dirname(target), exist_ok=True)
+		try:
+			os.replace(path, target)
+		except OSError as e:
+			print(f"Failed to move {path} -> {target}: {e}")
+			continue
+		print(f"Moved {activity_id} -> {target}")
+		moved += 1
+	print(f"Rescan complete: moved {moved} files.")
+	return 0
+
+
+def _resolve_location_from_coords(lat: float, lng: float, args, geocode_cache: Dict[str, Dict[str, str]]) -> Optional[Dict[str, str]]:
+	"""Return a location dict for the given coordinates, using cache and optional geocoding."""
+	if not args.geocode:
+		return None
+	key = _coords_cache_key(lat, lng)
+	if key not in geocode_cache:
+		geo = reverse_geocode_nominatim(lat, lng)
+		geocode_cache[key] = geo
+		if args.geocode_sleep_ms:
+			time.sleep(max(0, int(args.geocode_sleep_ms)) / 1000.0)
+	geo = geocode_cache[key]
+	if geo["city"] or geo["state"] or geo["country"]:
+		return geo
+	return None
+
+
+def _coords_cache_key(lat: float, lng: float) -> str:
+	return f"{lat:.3f},{lng:.3f}"
+
+
+def _extract_latlng_from_file(path: str, fmt: str) -> Optional[Tuple[float, float]]:
+	fmt = fmt.lower()
+	if fmt in ("gpx", "tcx"):
+		return _extract_latlng_from_xml(path, fmt)
+	if fmt == "original":
+		return _extract_latlng_from_original_zip(path)
+	return None
+
+
+def _extract_latlng_from_xml(path: str, fmt: str) -> Optional[Tuple[float, float]]:
+	try:
+		tree = ET.parse(path)
+	except (ET.ParseError, OSError):
+		return None
+	root = tree.getroot()
+	return _extract_latlng_from_root(root, fmt)
+
+
+def _extract_latlng_from_stream(stream, fmt: str) -> Optional[Tuple[float, float]]:
+	try:
+		tree = ET.parse(stream)
+	except (ET.ParseError, OSError):
+		return None
+	root = tree.getroot()
+	return _extract_latlng_from_root(root, fmt)
+
+
+def _extract_latlng_from_root(root: ET.Element, fmt: str) -> Optional[Tuple[float, float]]:
+	fmt = fmt.lower()
+	if fmt == "gpx":
+		return _find_first_gpx_latlng(root)
+	if fmt == "tcx":
+		return _find_first_tcx_latlng(root)
+	return None
+
+
+def _find_first_gpx_latlng(root: ET.Element) -> Optional[Tuple[float, float]]:
+	for elem in root.iter():
+		tag = elem.tag.lower()
+		if tag.endswith("trkpt"):
+			lat = elem.attrib.get("lat")
+			lon = elem.attrib.get("lon")
+			if lat and lon:
+				try:
+					return float(lat), float(lon)
+				except (ValueError, TypeError):
+					continue
+	return None
+
+
+def _find_first_tcx_latlng(root: ET.Element) -> Optional[Tuple[float, float]]:
+	for elem in root.iter():
+		tag = elem.tag.lower()
+		if tag.endswith("trackpoint"):
+			lat_text = elem.findtext(".//{*}LatitudeDegrees")
+			lon_text = elem.findtext(".//{*}LongitudeDegrees")
+			if lat_text and lon_text:
+				try:
+					return float(lat_text), float(lon_text)
+				except (ValueError, TypeError):
+					continue
+	return None
 
 def _extract_latlng_from_original_zip(path: str) -> Optional[Tuple[float, float]]:
 	try:
