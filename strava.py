@@ -1097,7 +1097,7 @@ def convert_gpx_to_fit(
 	avg_speed_mps = (distance_m / total_time_s) if total_time_s > 0 else 0.0
 	# Sport mapping (FIT profile Sport enum):
 	# 0 generic, 1 running, 2 cycling, 3 transition, 4 fitness_equipment, 5 swimming,
-	# 8 tennis, 14 hiking, 15 walking.
+	# 8 tennis, 17 hiking, 11 walking. (FIT sport enum)
 	atype = activity_type.lower()
 	# Primary sport determination
 	sport_enum = 0; subsport_enum = 0
@@ -1105,7 +1105,7 @@ def convert_gpx_to_fit(
 	elif atype in ('ride','cycling'): sport_enum = 2
 	elif atype in ('swim','swimming'): sport_enum = 5
 	elif atype in ('walk','walking'): sport_enum = 11
-	elif atype in ('hike','hiking'): sport_enum = 14
+	elif atype in ('hike','hiking'): sport_enum = 17
 	elif atype in ('tennis',): sport_enum = 8
 	# Walking display strategy: if prefer_generic_with_subsport and walking detected, force sport=0 generic, subsport=36 walking.
 	is_walking = atype in ('walk','walking')
@@ -1161,7 +1161,7 @@ def convert_gpx_to_fit(
 	# Optional sport message (global 12) to provide textual sport name for external tools.
 	if include_sport_message:
 		# Title-case mapping to align with reference FIT sample naming (e.g., 'Walk')
-		name_map = {0:'Generic',1:'Run',2:'Ride',5:'Swim',8:'Tennis',11:'Walk',14:'Hike'}
+		name_map = {0:'Generic',1:'Run',2:'Ride',5:'Swim',8:'Tennis',11:'Walk',17:'Hike'}
 		name_bytes = name_map.get(sport_enum,'activity').encode('utf-8')[:128]
 		name_padded = name_bytes + b'\x00' * (128 - len(name_bytes))
 		sport_def = def_message(7, 12, [
@@ -1551,7 +1551,7 @@ def validate_fit(path: str) -> Dict[str, Any]:
 						val_s = decoded.get(key)
 						if isinstance(val_s, int):
 							effective_sport = val_s; break
-					alias_map = {0: 'Generic', 1: 'Run', 2: 'Ride', 5: 'Swim', 8: 'Tennis', 11: 'Walk', 14: 'Hike'}
+					alias_map = {0: 'Generic', 1: 'Run', 2: 'Ride', 5: 'Swim', 8: 'Tennis', 11: 'Walk', 17: 'Hike'}
 					if isinstance(effective_sport, int):
 						decoded["activity"] = alias_map.get(effective_sport, 'Activity')
 				# Propagate last sport name/popularity to session records for easier inspection
