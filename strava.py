@@ -94,6 +94,9 @@ def _resolve_location_from_coords(lat: float, lng: float, args, geocode_cache: D
 	"""Return a location dict for the given coordinates, using cache and optional geocoding."""
 	if not args.geocode:
 		return None
+	# Skip invalid/placeholder coordinates (privacy or treadmill may result in 0,0)
+	if abs(lat) < 1e-6 and abs(lng) < 1e-6:
+		return None
 	key = _coords_cache_key(lat, lng)
 	if key not in geocode_cache:
 		geo = reverse_geocode_nominatim(lat, lng)
@@ -1640,7 +1643,8 @@ def reverse_geocode_nominatim(lat: float, lng: float, *, timeout_s: int = 15) ->
 		"lat": f"{lat:.6f}",
 		"lon": f"{lng:.6f}",
 		"format": "json",
-		"zoom": 10,
+		# Higher zoom provides better city-level results from OSM
+		"zoom": 14,
 		"addressdetails": 1,
 	}
 	headers = {
@@ -2027,8 +2031,8 @@ def main(argv: Optional[Iterable[str]] = None) -> int:
 						if args.detail_sleep_ms and args.detail_sleep_ms > 0:
 							time.sleep(args.detail_sleep_ms / 1000.0)
 
-				# If still missing and geocode enabled, try reverse geocoding
-				if not cached_activity and args.geocode and not (loc["city"] or loc["state"] or loc["country"]):
+				# If still missing and geocode enabled, try reverse geocoding (even if cached)
+				if args.geocode and not (loc["city"] or loc["state"] or loc["country"]):
 					latlng = act.get("start_latlng")
 					if isinstance(latlng, (list, tuple)) and len(latlng) == 2 and all(isinstance(x, (int, float)) for x in latlng):
 						lat = _round_coord(float(latlng[0]))
@@ -2080,12 +2084,34 @@ def main(argv: Optional[Iterable[str]] = None) -> int:
 				if args.download:
 					path = build_download_path(args.download_dir, act_type, loc, activity_id, args.download_format)
 					has_file = os.path.exists(path)
+					moved_file = False
+					# If cached file exists under unknown_* tree, move it to the new resolved location
+					if cached_activity and not has_file:
+						unknown_path = build_download_path(
+							args.download_dir,
+							act_type,
+							{"city": "", "state": "", "country": ""},
+							activity_id,
+							args.download_format,
+						)
+						if os.path.exists(unknown_path):
+							os.makedirs(os.path.dirname(path), exist_ok=True)
+							try:
+								os.replace(unknown_path, path)
+								moved_file = True
+								has_file = True
+								if not args.download_quiet:
+									print(f"Moved cached activity {activity_id} -> {path}")
+							except Exception as move_err:
+								if not args.download_quiet:
+									print(f"Failed to move cached activity {activity_id} from {unknown_path} to {path}: {move_err}")
+					# If still cached but file not at target, drop from cache to trigger (re)download at correct location
 					if cached_activity and not has_file:
 						already_downloaded.discard(activity_id)
 						cached_activity = False
 					if cached_activity and has_file:
 						cache_skipped += 1
-						if not args.download_quiet:
+						if not moved_file and not args.download_quiet:
 							print(f"Skipping activity {activity_id}, already downloaded -> {path}")
 					else:
 						os.makedirs(os.path.dirname(path), exist_ok=True)
@@ -2122,9 +2148,6 @@ def main(argv: Optional[Iterable[str]] = None) -> int:
 				# Update simple progress bar after each activity processed
 				progress.update(total, details_calls, details_ok, downloaded)
 			if stop_pagination:
-				break
-			if args.download and current_page_seen_matching and not current_page_has_new:
-				print("All remaining matching activities already downloaded, stopping pagination.", flush=True)
 				break
 			page += 1
 			if effective_max_pages is not None and page > effective_max_pages:
